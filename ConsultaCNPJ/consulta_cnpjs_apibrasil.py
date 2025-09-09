@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Consulta massiva de CNPJs usando APIBrasil (Jonathan)
-Endpoint: POST /dados/cnpj
-Regras:
- - Pausa de 0.2s entre consultas
- - Pausa de 2s a cada 10 consultas
- - Cache local em JSON
+Consulta massiva de CNPJs usando BrasilAPI
+Retorna JSON completo + planilhas resumidas (cnpj, nome, uf)
+Com cache local e funções reutilizáveis
 """
 
 import os
@@ -21,7 +18,7 @@ import pandas as pd
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-API_URL = "https://gateway.apibrasil.io/api/v2/dados/cnpj"
+API_URL = "https://brasilapi.com.br/api/cnpj/v1/{cnpj}"
 
 # --------------------------
 # Utilitários CNPJ
@@ -71,44 +68,56 @@ def save_cache(cache: Dict[str, Any], path: str):
         json.dump(cache, f, ensure_ascii=False, indent=2)
 
 # --------------------------
-# Consulta API
+# Consulta API BrasilAPI
 # --------------------------
-def consulta_cnpj(cnpj: str, bearer: str, device: str, timeout: int = 15) -> Any:
-    headers = {
-        "Authorization": f"Bearer {bearer}",
-        "DeviceToken": device,
-        "Content-Type": "application/json"
-    }
-    payload = {"cnpj": cnpj}
-    resp = requests.post(API_URL, headers=headers, json=payload, timeout=timeout)
+def consulta_cnpj(cnpj: str, timeout: int = 14) -> dict:
+    url = API_URL.format(cnpj=cnpj)
+    resp = requests.get(url, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
 # --------------------------
-# Extrair campos úteis
+# Funções Reutilizáveis
 # --------------------------
-def find_value(obj: dict, keys: List[str]):
-    if not isinstance(obj, dict):
-        return None
-    for k in keys:
-        if k in obj and obj[k]:
-            return obj[k]
-    for v in obj.values():
-        if isinstance(v, dict):
-            res = find_value(v, keys)
-            if res:
-                return res
-    return None
+def consulta_completa(cnpj: str, cache_path="cache.json", force=False) -> dict:
+    cache = load_cache(cache_path)
+    if not validate_cnpj(cnpj):
+        return {"cnpj": cnpj, "error": "CNPJ inválido"}
+    if cnpj in cache and not force:
+        return cache[cnpj]
+    try:
+        api_json = consulta_cnpj(cnpj)
+        cache[cnpj] = api_json
+    except Exception as e:
+        api_json = {"cnpj": cnpj, "error": str(e)}
+        cache[cnpj] = api_json
+    save_cache(cache, cache_path)
+    return api_json
 
-def extract_minimal(api_json: Any) -> Dict[str, Any]:
-    if not api_json:
-        return {"razao_social": None, "situacao": None, "uf": None}
-    obj = api_json if isinstance(api_json, dict) else {}
+def consulta_uf(cnpj: str, cache_path="cache.json", force=False) -> dict:
+    full = consulta_completa(cnpj, cache_path, force)
+    if "error" in full:
+        return full
     return {
-        "razao_social": find_value(obj, ["razao_social", "nome", "nome_empresarial", "nome_fantasia"]),
-        "situacao": find_value(obj, ["situacao", "situacao_cadastral", "status"]),
-        "uf": find_value(obj, ["uf", "estado", "sigla_uf"])
+        "cnpj": full.get("cnpj", ""),
+        "nome": full.get("razao_social", full.get("nome", "")),
+        "uf": full.get("uf", "")
     }
+
+def processar_lista(cnpjs: List[str], cache_path="cache.json",
+                    wait_between=0.2, pause_every=10, pause_seconds=2) -> List[dict]:
+    resultados = []
+    for i, cnpj in enumerate(cnpjs, start=1):
+        resultado = consulta_uf(cnpj, cache_path)
+        resultados.append(resultado)
+        logging.info(f"{i}/{len(cnpjs)} - {resultado.get('cnpj', '???')}")
+
+        # Pausa entre consultas
+        time.sleep(wait_between)
+        if i % pause_every == 0:
+            logging.info(f"Pausa de {pause_seconds}s após {i} consultas")
+            time.sleep(pause_seconds)
+    return resultados
 
 # --------------------------
 # Orquestrador
@@ -116,69 +125,38 @@ def extract_minimal(api_json: Any) -> Dict[str, Any]:
 def run(args):
     cnpjs = read_input_file(args.input)
     logging.info(f"Lidos {len(cnpjs)} CNPJs")
+    resultados = processar_lista(cnpjs, args.cache, args.wait_between, args.pause_every, args.pause_seconds)
 
-    cache = load_cache(args.cache)
-    results = []
-    query_count = 0
-
-    for i, cnpj in enumerate(cnpjs, start=1):
-        if not validate_cnpj(cnpj):
-            logging.warning(f"{i}/{len(cnpjs)} - CNPJ inválido: {cnpj}")
-            results.append({"CNPJ": cnpj, "Razao Social": None, "Situacao Cadastral": "CNPJ inválido", "UF": None})
-            continue
-
-        if cnpj in cache and not args.force:
-            api_json = cache[cnpj]
-            logging.info(f"{i}/{len(cnpjs)} - {cnpj} (cache)")
-        else:
-            try:
-                api_json = consulta_cnpj(cnpj, args.bearer, args.device, timeout=args.timeout)
-                cache[cnpj] = api_json
-                save_cache(cache, args.cache)
-                logging.info(f"{i}/{len(cnpjs)} - {cnpj} (ok)")
-            except Exception as e:
-                api_json = {"__error__": str(e)}
-                cache[cnpj] = api_json
-                save_cache(cache, args.cache)
-                logging.error(f"{i}/{len(cnpjs)} - {cnpj} (erro: {e})")
-            time.sleep(args.wait_between)
-
-        minimal = extract_minimal(api_json)
-        results.append({
-            "CNPJ": cnpj,
-            "Razao Social": minimal.get("razao_social"),
-            "Situacao Cadastral": minimal.get("situacao"),
-            "UF": minimal.get("uf")
-        })
-
-        query_count += 1
-        if query_count % args.pause_every == 0:
-            logging.info(f"Pausa de {args.pause_seconds}s...")
-            time.sleep(args.pause_seconds)
-
-    df = pd.DataFrame(results, columns=["CNPJ", "Razao Social", "Situacao Cadastral", "UF"])
+    # --------------------------
+    # Salvar arquivos
+    # --------------------------
     os.makedirs(args.out_dir, exist_ok=True)
+
+    # JSON completo
+    with open(os.path.join(args.out_dir, "results.json"), "w", encoding="utf-8") as f:
+        json.dump(resultados, f, ensure_ascii=False, indent=2)
+
+    # DataFrame resumido (apenas cnpj, nome, uf)
+    df = pd.DataFrame(resultados)
     df.to_excel(os.path.join(args.out_dir, "results.xlsx"), index=False)
-    df.to_csv(os.path.join(args.out_dir, "results.csv"), index=False)
-    logging.info("Planilhas salvas em /out")
-    save_cache(cache, args.cache)
+    df.to_csv(os.path.join(args.out_dir, "results.csv"), index=False, sep=";")
+
+    logging.info("Planilhas (resumidas) e JSON (completo) salvos com sucesso.")
 
 # --------------------------
 # CLI
 # --------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Consulta CNPJs via APIBrasil")
+    p = argparse.ArgumentParser(description="Consulta CNPJs via BrasilAPI")
     p.add_argument("--input", required=True, help="Arquivo .xlsx, .csv ou .txt com CNPJs")
-    p.add_argument("--bearer", required=True, help="Bearer Token da APIBrasil")
-    p.add_argument("--device", required=True, help="Device Token da APIBrasil")
     p.add_argument("--cache", default="cache.json", help="Arquivo de cache")
     p.add_argument("--out-dir", default="out", help="Diretório de saída")
     p.add_argument("--wait-between", type=float, default=0.2, help="Tempo entre consultas (s)")
     p.add_argument("--pause-every", type=int, default=10, help="Pausa a cada N consultas")
     p.add_argument("--pause-seconds", type=float, default=2.0, help="Duração da pausa (s)")
-    p.add_argument("--timeout", type=int, default=15, help="Timeout HTTP")
     p.add_argument("--force", action="store_true", help="Força nova consulta mesmo se existir no cache")
     return p.parse_args()
 
 if __name__ == "__main__":
     run(parse_args())
+    
